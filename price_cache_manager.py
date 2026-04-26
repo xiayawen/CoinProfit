@@ -1,41 +1,60 @@
-# ============================================================
-# 0. Imports & Config
-# ============================================================
-
-import pandas as pd
 import yfinance as yf
-import time
-import random
+import pandas as pd
 from pathlib import Path
 
-DATA_DIR = Path("price_data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path("price_cache")
+DATA_DIR.mkdir(exist_ok=True)
 
 
-# ============================================================
-# 1. Download OHLCV
-# ============================================================
+# =========================
+# 1. 单 ticker cache
+# =========================
+def _load_or_update_single_ticker(ticker, start="2000-01-01"):
+    path = DATA_DIR / f"{ticker}.csv"
 
-def download_ohlcv(ticker, start=None, end=None):
-    """
-    Download OHLCV data from Yahoo Finance
-    """
-    df = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        auto_adjust=False,
-        progress=False
-    )
+    # ---------- no cache ----------
+    if not path.exists():
+        df = yf.download(ticker, start=start, progress=False)
+        df = _clean_columns(df)
+        df.to_csv(path)
 
-    if df.empty:
-        print(f"No data for {ticker}")
-        return pd.DataFrame()
+    # ---------- load ----------
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
 
-    df = df.reset_index()
+    # ---------- update ----------
+    if not df.empty:
+        last_date = df.index.max()
+        start_update = last_date - pd.Timedelta(days=5)
+
+        new_df = yf.download(ticker, start=start_update, progress=False)
+        new_df = _clean_columns(new_df)
+
+        if not new_df.empty:
+            df = pd.concat([df, new_df])
+            df = df[~df.index.duplicated(keep="last")]
+            df = df.sort_index()
+
+            df.to_csv(path)
+
+    return df
+
+
+def _clean_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+# =========================
+# 2. 转 long format
+# =========================
+def _to_long_format(df, ticker):
+    df = df.copy()
+
+    df["date"] = df.index
+    df["ticker"] = ticker
 
     df = df.rename(columns={
-        "Date": "date",
         "Open": "open",
         "High": "high",
         "Low": "low",
@@ -44,169 +63,32 @@ def download_ohlcv(ticker, start=None, end=None):
         "Volume": "volume"
     })
 
-    df["ticker"] = ticker
-    df["date"] = pd.to_datetime(df["date"])
+    # 🔥 关键：如果没有 adj_close，就用 close 代替
+    if "adj_close" not in df.columns:
+        df["adj_close"] = df["close"]
 
-    return df
+    cols = ["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"]
 
-
-# ============================================================
-# 2. Cache paths
-# ============================================================
-
-def get_price_cache_path(ticker, data_dir=DATA_DIR):
-    ticker = ticker.upper().strip()
-    return data_dir / f"{ticker}_ohlcv.csv"
+    return df[cols]
 
 
-# ============================================================
-# 3. Read cache
-# ============================================================
-
-def read_cached_price(ticker, data_dir=DATA_DIR):
-    path = get_price_cache_path(ticker, data_dir)
-
-    if not path.exists():
-        return pd.DataFrame()
-
-    df = pd.read_csv(path)
-
-    if not df.empty and "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    return df
-
-
-# ============================================================
-# 4. Save cache
-# ============================================================
-
-def save_cached_price(ticker, df, data_dir=DATA_DIR):
-    path = get_price_cache_path(ticker, data_dir)
-
-    data_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-
-    print(f"Saved cache for {ticker} → {path}")
-
-
-# ============================================================
-# 5. Core: load or update
-# ============================================================
-
-def load_or_update_price(ticker, data_dir=DATA_DIR):
-    """
-    Main cache logic:
-
-    If no cache:
-        download full history
-
-    If cache exists:
-        only fetch new data
-    """
-    ticker = ticker.upper().strip()
-    path = get_price_cache_path(ticker, data_dir)
-
-    # =========================
-    # Case 1: No cache
-    # =========================
-    if not path.exists():
-        print(f"{ticker}: no cache, downloading full history...")
-
-        df = download_ohlcv(ticker)
-
-        if not df.empty:
-            df = df.sort_values("date")
-            save_cached_price(ticker, df, data_dir)
-
-        return df
-
-    # =========================
-    # Case 2: Cache exists
-    # =========================
-    print(f"{ticker}: cache found, checking updates...")
-
-    df_cached = read_cached_price(ticker, data_dir)
-
-    if df_cached.empty or "date" not in df_cached.columns:
-        print(f"{ticker}: cache broken, re-downloading...")
-
-        df = download_ohlcv(ticker)
-
-        if not df.empty:
-            df = df.sort_values("date")
-            save_cached_price(ticker, df, data_dir)
-
-        return df
-
-    last_date = df_cached["date"].max()
-
-    print(f"{ticker}: last cached date = {last_date}")
-
-    # 防止重复，+1天
-    start_new = last_date + pd.Timedelta(days=1)
-
-    df_new = download_ohlcv(ticker, start=start_new)
-
-    if df_new.empty:
-        print(f"{ticker}: already up to date.")
-        return df_cached
-
-    print(f"{ticker}: found {len(df_new)} new rows")
-
-    # =========================
-    # Merge + deduplicate
-    # =========================
-    df_all = pd.concat([df_cached, df_new], ignore_index=True)
-
-    df_all = df_all.drop_duplicates(subset=["date"])
-    df_all = df_all.sort_values("date").reset_index(drop=True)
-
-    save_cached_price(ticker, df_all, data_dir)
-
-    return df_all
-
-
-# ============================================================
-# 6. Multi-ticker
-# ============================================================
-
-def load_or_update_prices(tickers, data_dir=DATA_DIR):
-    all_data = []
+# =========================
+# 3. 多 ticker 主函数
+# =========================
+def get_clean_price_df(tickers):
+    all_df = []
 
     for ticker in tickers:
-        print(f"\nProcessing {ticker}...")
+        print(f"Processing {ticker}...")
 
-        try:
-            df = load_or_update_price(ticker, data_dir)
+        df = _load_or_update_single_ticker(ticker)
+        df_long = _to_long_format(df, ticker)
 
-            if not df.empty:
-                all_data.append(df)
+        all_df.append(df_long)
 
-            # 模拟你SEC那种防限速节奏（好习惯）
-            sleep_time = 1 + random.uniform(0, 1)
-            time.sleep(sleep_time)
+    df_all = pd.concat(all_df, ignore_index=True)
 
-        except Exception as e:
-            print(f"Failed for {ticker}: {e}")
-
-    if not all_data:
-        return pd.DataFrame()
-
-    df_all = pd.concat(all_data, ignore_index=True)
-
-    print("\nFinal shape:", df_all.shape)
+    # 🔥 非常关键：排序
+    df_all = df_all.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     return df_all
-
-
-# ============================================================
-# 7. Example run
-# ============================================================
-
-if __name__ == "__main__":
-    tickers = ["AAPL", "NVDA", "MSFT", "AMD"]
-
-    df_all = load_or_update_prices(tickers)
-
-    print(df_all.head())
